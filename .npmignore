@@ -1,0 +1,13 @@
+.github/
+.idea/
+.vscode/
+
+test/
+tests/
+coverage/
+*.lcov
+
+.env
+*.log
+
+package-lock.json

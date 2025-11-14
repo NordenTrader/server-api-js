@@ -1,11 +1,38 @@
+/**
+ * ion-server-api
+ * High-performance TCP client for IonTrader platform
+ * Supports real-time quotes, trades, balance, user & symbol events
+ */
+
 const net = require('net');
 const events = require('events');
 const { jsonrepair } = require('jsonrepair');
-
 const shortid = require('shortid');
+
+// Configure shortid for safe extID generation
 shortid.characters('0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ$@');
 
+const RECONNECT_DELAY_MS = 4000;
+const RESPONSE_TIMEOUT_MS = 30000;
+const AUTO_SUBSCRIBE_DELAY_MS = 500;
+const SOCKET_KEEPALIVE = true;
+const SOCKET_NODELAY = true;
+
 class IONPlatform {
+    /**
+     * Create a new IONPlatform instance
+     * @param {string} url - Host and port (e.g., 'host:8080')
+     * @param {string} name - Identifier for logging
+     * @param {Object} [options={}] - Configuration
+     * @param {Array<string>} [options.autoSubscribe=[]] - Auto-subscribe channels
+     * @param {boolean} [options.ignoreEvents=false] - Disable event emission
+     * @param {string} [options.prefix='ion'] - Event prefix
+     * @param {string} [options.mode='live'] - 'live' || 'demo' || ...
+     * @param {Object} [broker={}] - Optional broker
+     * @param {Object} [ctx={}] - Optional context
+     * @param {string} token - JWT authentication token
+     * @param {EventEmitter} [emitter=null] - Custom EventEmitter
+     */
     constructor(url, name, options = {}, broker, ctx, token, emitter = null) {
         this.name = name;
         this.url = url;
@@ -17,158 +44,272 @@ class IONPlatform {
         this.mode = options.mode || 'live';
         this.token = token;
         this.emitter = emitter || new events.EventEmitter();
+        this.autoSubscribeChannels = Array.isArray(options.autoSubscribe) ? options.autoSubscribe : [];
+        this.seenNotifyTokens = new Set();
+
         this.createSocket();
 
-        // Return a Proxy to handle dynamic method calls
+        // Return proxy for dynamic command calls
         return new Proxy(this, {
-            get: (target, prop, receiver) => {
-                // If the property exists on the target, return it
-                if (prop in target) {
-                    return Reflect.get(target, prop, receiver);
-                }
-                // Otherwise, treat prop as a command name and return a function
-                return async function(data = {}) {
-                    // Transform data into the send format
-                    const transformedData = {
-                        command: prop,
-                        data
-                    };
-                    // Generate extID if not provided
-                    if (!transformedData.extID) {
-                        transformedData.extID = shortid.generate();
-                    }
-                    // Send the command
-                    return target.send(transformedData);
-                };
+            get: (target, prop) => {
+                if (prop in target) return Reflect.get(target, prop);
+                return (data = {}) => target.callCommand(prop, data);
             }
         });
     }
 
+    /**
+     * Establish TCP connection and set up event handlers
+     */
     createSocket() {
         this.errorCount = 0;
         this.connected = false;
         this.alive = true;
         this.recv = '';
+        this.seenNotifyTokens.clear();
 
-        // Create a new TCP socket
         this.socket = new net.Socket();
-        this.socket.setKeepAlive(true);
-        this.socket.setNoDelay();
+        this.socket.setKeepAlive(SOCKET_KEEPALIVE);
+        this.socket.setNoDelay(SOCKET_NODELAY);
 
-        // Set up socket event handlers
         this.socket
             .on('connect', () => {
-                console.info('IONPlatform connected', this.name, this.url);
+                console.info(`ION [${this.name}] Connected to ${this.url}`);
                 this.connected = true;
+                this.seenNotifyTokens.clear();
+
+                // Auto-subscribe after connection
+                if (this.autoSubscribeChannels.length > 0) {
+                    setTimeout(() => {
+                        this.subscribe(this.autoSubscribeChannels)
+                            .then(() => console.info(`ION [${this.name}] Auto-subscribed: ${this.autoSubscribeChannels.join(', ')}`))
+                            .catch(err => console.error(`ION [${this.name}] Auto-subscribe failed:`, err.message));
+                    }, AUTO_SUBSCRIBE_DELAY_MS);
+                }
             })
             .on('timeout', () => {
-                console.error('IONPlatform timeout connection', this.name, this.url);
+                console.error(`ION [${this.name}] Socket timeout`);
                 if (this.alive) this.reconnect();
             })
             .on('close', () => {
                 this.connected = false;
-                console.warn('IONPlatform closed', this.name);
+                console.warn(`ION [${this.name}] Connection closed`);
                 if (this.alive) this.reconnect();
             })
             .on('error', (err) => {
-                console.error('IONPlatform socket error', this.name, err.message);
+                console.error(`ION [${this.name}] Socket error:`, err.message);
                 if (this.alive) this.reconnect();
             })
-            .on('data', (data) => {
-                this.recv += data.toString();
+            .on('data', (data) => this.handleData(data));
 
-                // Process received data
-                let lastDelimiterPosition = this.recv.lastIndexOf('\r\n');
+        const [host, port] = this.url.split(':');
+        this.socket.connect({ host, port });
+    }
 
-                if (lastDelimiterPosition === -1) {
-                    return;
+    /**
+     * Handle incoming TCP data
+     * @param {Buffer} data - Raw TCP chunk
+     */
+    handleData(data) {
+        this.recv += data.toString();
+
+        const delimiterPos = this.recv.lastIndexOf('\r\n');
+        if (delimiterPos === -1) return;
+
+        const received = this.recv.slice(0, delimiterPos);
+        this.recv = this.recv.slice(delimiterPos + 2);
+        const tokens = received.split('\r\n');
+
+        for (const token of tokens) {
+            if (!token.trim()) continue;
+
+            let parsed;
+            try {
+                const cleaned = token.replace(/[\n\r\t]/g, '').trim();
+                parsed = JSON.parse(jsonrepair(cleaned));
+            } catch (e) {
+                console.error(`ION [${this.name}] Parse error:`, token, e.message);
+                continue;
+            }
+
+            // === ARRAY MESSAGES ===
+            if (Array.isArray(parsed)) {
+                const [marker] = parsed;
+
+                // Quote: ["t", symbol, bid, ask, timestamp]
+                if (marker === 't' && parsed.length >= 4) {
+                    const [, symbol, bid, ask, timestamp] = parsed;
+                    if (typeof symbol === 'string' && typeof bid === 'number' && typeof ask === 'number') {
+                        const quote = {
+                            symbol,
+                            bid,
+                            ask,
+                            timestamp: timestamp ? new Date(timestamp * 1000) : null
+                        };
+                        this.emit('quote', quote);
+                        this.emit(`quote:${symbol.toUpperCase()}`, quote);
+                    }
+                    continue;
                 }
 
-                let received = this.recv.slice(0, lastDelimiterPosition);
-                this.recv = this.recv.slice(lastDelimiterPosition + 2);
+                // Notify: ["n", msg, desc, token, status, level, user_id, time, data?, code]
+                if (marker === 'n' && parsed.length >= 8) {
+                    const [
+                        , message, description, token, status, level, user_id, create_time, dataOrCode, code
+                    ] = parsed;
+                    const isObject = dataOrCode && typeof dataOrCode === 'object';
+                    const notify = {
+                        message, description, token, status, level, user_id,
+                        create_time: create_time ? new Date(create_time * 1000) : null,
+                        data: isObject ? dataOrCode : {},
+                        code: Number(isObject ? code : dataOrCode)
+                    };
+                    if (this.seenNotifyTokens.has(token)) continue;
+                    this.seenNotifyTokens.add(token);
+                    this.emit('notify', notify);
+                    this.emit(`notify:${level}`, notify);
+                    continue;
+                }
 
-                let tokens = received.split('\r\n');
+                // Symbols Reindex: ["sr", [[symbol, sym_index, sort_index], ...]]
+                if (marker === 'sr' && parsed.length === 2) {
+                    const [, symbols] = parsed;
+                    this.emit('symbols:reindex', symbols);
+                    continue;
+                }
 
-                tokens.forEach(async (token) => {
-                    if (token.length > 0) {
-                        let data;
+                // Security Reindex: ["sc", [[sec_index, sort_index], ...]]
+                if (marker === 'sc' && parsed.length === 2) {
+                    const [, groups] = parsed;
+                    this.emit('security:reindex', groups);
+                    continue;
+                }
 
-                        try {
-                            data = JSON.parse(jsonrepair(token.replace(/[\n\r\t]/g, '').replace(/[-\u0019]+/g, "")));
-                        } catch (e) {
-                            console.error('Parse error:', token, e.message);
-                            return;
-                        }
+                console.warn(`ION [${this.name}] Unknown array message:`, parsed);
+                continue;
+            }
 
-                        if (data.extID) {
-                            this.emitter.emit(data.extID, data);
-                        }
-                    }
-                });
+            // === JSON EVENT OBJECTS ===
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && parsed.event) {
+                const { event, type, data } = parsed;
+
+                this.emit(event, { type, data });
+
+                if (data?.login) this.emit(`${event}:${data.login}`, { type, data });
+                if (data?.symbol) this.emit(`${event}:${data.symbol}`, { type, data });
+                if (data?.group) this.emit(`${event}:${data.group}`, { type, data });
+
+                continue;
+            }
+
+            // === COMMAND RESPONSES (extID) ===
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && parsed.extID) {
+                this.emit(parsed.extID, parsed);
+                continue;
+            }
+
+            console.warn(`ION [${this.name}] Unknown message:`, parsed);
+        }
+    }
+
+    /**
+     * Emit event if not ignored
+     * @param {string} name - Event name
+     * @param {*} data - Event data
+     */
+    emit(name, data) {
+        if (!this.ignoreEvents) {
+            this.emitter.emit(name, data);
+        }
+    }
+
+    /**
+     * Send command via proxy (e.g., platform.AddUser())
+     * @param {string} command - Command name
+     * @param {Object} data - Command payload
+     * @returns {Promise<Object>}
+     */
+    async callCommand(command, data = {}) {
+        const payload = { command, data };
+        if (!payload.extID) payload.extID = shortid.generate();
+        return this.send(payload);
+    }
+
+    /**
+     * Low-level send (legacy format)
+     * @param {Object} payload - { command, data, extID?, __token }
+     * @returns {Promise<Object>}
+     */
+    async send(payload) {
+        if (!payload.extID) payload.extID = shortid.generate();
+        payload.__token = this.token;
+
+        if (!this.connected) {
+            return Promise.reject(new Error(`ION [${this.name}] Not connected`));
+        }
+
+        return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                reject(new Error(`ION [${this.name}] Timeout for extID: ${payload.extID}`));
+            }, RESPONSE_TIMEOUT_MS);
+
+            this.emitter.once(payload.extID, (resp) => {
+                clearTimeout(timeout);
+                resolve(resp);
             });
 
-        // Connect to the specified host and port
-        let url_pars = this.url.split(':');
-
-        this.socket.connect({ host: url_pars[0], port: url_pars[1] }, (err) => {
-            if (err) {
-                console.error('IONPlatform connection error', this.name, err.message);
-                if (this.alive) this.reconnect();
+            try {
+                this.socket.write(JSON.stringify(payload) + "\r\n");
+            } catch (err) {
+                clearTimeout(timeout);
+                reject(err);
             }
         });
     }
 
-    async send(data) {
-        if (!data.extID) {
-            data.extID = shortid.generate();
-        }
-        // Add authentication token to data
-        data.__token = this.token;
-
-        if (!this.connected) {
-            console.warn('IONPlatform not connected', this.name);
-            return Promise.reject(new Error(`Socket not connected for ${this.name}`));
-        }
-
-        try {
-            this.socket.write(JSON.stringify(data) + "\r\n");
-
-            return await new Promise((resolve, reject) => {
-                const timeoutId = setTimeout(() => {
-                    console.warn('IONPlatform response timeout', this.name, data.extID);
-                    reject(new Error(`Response timeout for extID: ${data.extID}`));
-                }, 30000);
-
-                this.emitter.once(data.extID, (response) => {
-                    clearTimeout(timeoutId);
-                    resolve(response);
-                });
-            });
-        } catch (err) {
-            console.error('IONPlatform send error', this.name, data.extID, err.message);
-            return Promise.reject(err);
-        }
+    /**
+     * Subscribe to market data channels (optimized for speed)
+     * @param {string|Array<string>} channels - Symbol(s) or channel(s)
+     * @returns {Promise<Object>}
+     */
+    async subscribe(channels) {
+        const chanels = Array.isArray(channels) ? channels : [channels];
+        return this.callCommand('Subscribe', { chanels });
     }
 
+    /**
+     * Unsubscribe from channels
+     * @param {string|Array<string>} channels - Symbol(s) to unsubscribe
+     * @returns {Promise<Object>}
+     */
+    async unsubscribe(channels) {
+        const chanels = Array.isArray(channels) ? channels : [channels];
+        return this.callCommand('Unsubscribe', { chanels });
+    }
+
+    /**
+     * Reconnect logic with backoff
+     */
     reconnect() {
-        // Destroy the current socket
+        if (!this.alive || this._reconnectTimer) return;
+
         this.socket.destroy();
-        if (!this._reconnectTimer) {
-            // Schedule a reconnect attempt
-            this._reconnectTimer = setTimeout(() => {
-                delete this._reconnectTimer;
-                this.lastReconnectTime = Date.now();
-                console.info('IONPlatform reconnecting', this.name);
-                this.createSocket();
-            }, 4000);
-        } else {
-            console.info('Reconnect already pending, doing nothing.', this.name);
-        }
+        this.seenNotifyTokens.clear();
+
+        this._reconnectTimer = setTimeout(() => {
+            delete this._reconnectTimer;
+            console.info(`ION [${this.name}] Reconnecting...`);
+            this.createSocket();
+        }, RECONNECT_DELAY_MS);
     }
 
+    /**
+     * Gracefully close connection
+     */
     destroy() {
-        // Mark platform as inactive and destroy the socket
         this.alive = false;
+        if (this._reconnectTimer) clearTimeout(this._reconnectTimer);
+        this.seenNotifyTokens.clear();
         this.socket.destroy();
     }
 }

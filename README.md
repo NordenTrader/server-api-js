@@ -1,155 +1,190 @@
+<div align="center">
+
 # ion-server-api
 
-A lightweight Node.js connector for the [IonTrader](https://iontrader.com/) trading platform, designed for high-speed server-to-server integration via TCP socket. It enables seamless communication with the IonTrader platform, supporting both old (`{ command, data, from }`) and new (flat objects like `{ login, volume, cmd, ... }`) command formats, with built-in event handling, automatic reconnection, and dynamic command invocation.
+**Ultra-low latency Node.js TCP client for [IonTrader](https://iontrader.com)**  
+Real-time market data, trade execution, balance & user management via TCP.
+
+![npm](https://img.shields.io/npm/v/ion-server-api?color=green)
+![Node.js](https://img.shields.io/badge/node-%3E%3D14-blue)
+![License](https://img.shields.io/badge/license-MIT-blue)
+![Downloads](https://img.shields.io/npm/dm/ion-server-api)
+
+> **Server-to-Server (S2S) integration** — ideal for brokers, CRMs, HFT bots, and back-office systems.
+
+[Documentation](https://iontrader.com/tcp) · [Examples](./example) · [Report Bug](https://github.com/iontrader/server-api-js/issues)
+
+</div>
+
+---
 
 ## Features
 
-- Connects to the IonTrader platform via TCP for ultra-low latency communication.
-- Supports legacy command format (`{ command, data, from }`) and modern flat object format (e.g., `{ login, volume, cmd, ... }`).
-- Dynamic command invocation (e.g., `platform.HealthCheck(data)`).
-- Automatic `extID` generation using `shortid`.
-- Configurable reconnection logic and robust error handling.
-- Minimal configuration with sensible defaults for easy integration.
-- Ideal for server-to-server integration, CRM systems, or desktop applications (not recommended for client terminals).
+| Feature | Description |
+|-------|-------------|
+| **TCP S2S** | Direct TCP connection — no HTTP overhead |
+| **Real-time Events** | Quotes, trades, balance, user & symbol updates |
+| **Optimized Subscribe** | `platform.subscribe()` / `unsubscribe()` |
+| **Dynamic Commands** | `platform.AddUser({})`, `platform.GetTrades()` |
+| **Auto-reconnect** | Robust reconnection with backoff |
+| **Event Filtering** | `ignoreEvents`, per-symbol listeners |
+| **extID Tracking** | Reliable command responses |
+| **JSON Repair** | Handles malformed packets gracefully |
 
-## About IonTrader
-
-[IonTrader](https://iontrader.com/) is an ultra-low latency institutional trading engine designed for brokers and fintech companies. It provides comprehensive brokerage services across multiple financial markets, including Forex, equities, and futures. Key features include White Label licensing, enhanced back-office functionality, and connectivity gateways to exchanges and liquidity providers.
-
-## Documentation
-
-For detailed information on available commands and integration options, refer to the official IonTrader documentation:
-- [Server API Documentation](https://iontrader.com/tcp/)
-- [Client API Documentation](https://iontrader.com/client-api/)
-- [FIX API Documentation](https://iontrader.com/fix-api/)
-
+---
 
 ## Installation
-
-Install the package via npm:
 
 ```bash
 npm install ion-server-api
 ```
 
-## Requirements
+> **Required**: Configure `shortid` for safe `extID` generation:
 
-- Node.js v14 or higher.
-- Dependencies: `net`, `events`, `jsonrepair`, `shortid` (automatically installed).
-
-## Usage
-
-### Basic Setup
-
-```javascript
-const IONPlatform = require('ion-server-api');
+```js
 const shortid = require('shortid');
-
-// Configure shortid character set
 shortid.characters('0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ$@');
+```
 
-// Initialize platform with minimal parameters
+---
+
+## Quick Start
+
+```js
+const IONPlatform = require('ion-server-api');
+
+// Initialize with minimal config
 const platform = new IONPlatform(
-  'example.host:8080', // URL (host:port)
-  'ion-example',       // Platform name
-  {},                  // Options (optional, defaults provided)
-  null,                // Broker (optional, defaults to {})
-  null,                // Context (optional, defaults to {})
-  'your-auth-token'    // Authentication token (required)
+  'broker.iontrader.com:8080', // Host:port
+  'my-trading-bot',
+  { autoSubscribe: ['EURUSD', 'BTCUSD'] },
+  null, null,
+  'your-jwt-auth-token'
 );
 
-// Send a command in the new format
-const data = {}; // If some data needed
-platform.HealthCheck(data)
-  .then(response => console.log('Response:', response))
-  .catch(error => console.error('Error:', error.message));
+// Real-time quotes
+platform.emitter.on('quote', q => {
+  console.log(`${q.symbol}: ${q.bid}/${q.ask}`);
+});
 
-// Clean up
+// Trade events
+platform.emitter.on('trade:event', e => {
+  const d = e.data;
+  console.log(`#${d.order} ${d.cmd === 0 ? 'BUY' : 'SELL'} ${d.volume} ${d.symbol}`);
+});
+
+// Subscribe to new symbol
+platform.subscribe('XAUUSD');
+
+// Create user
+await platform.AddUser({
+  name: 'John Doe',
+  group: 'VIP',
+  leverage: 500,
+  email: 'john@example.com'
+});
+
+// Graceful shutdown
 platform.destroy();
 ```
 
-### Sending Commands
+---
 
-The package supports two command formats:
+## Supported Events
 
-1. **Old Format** (for compatibility with existing systems):
-   ```javascript
-   const data = {
-     command: 'HealthCheck',
-     data: {},
-     from: 123
-   };
-   data.extID = shortid.generate();
-   platform.send(data);
-   ```
+| Event | Description | Example |
+|------|-------------|--------|
+| `quote` | Real-time tick | `{ symbol: 'EURUSD', bid: 1.085, ask: 1.086 }` |
+| `quote:SYMBOL` | Per-symbol | `quote:EURUSD` |
+| `notify` | System alerts | `notify:20` (warning) |
+| `trade:event` | Order open/close/modify | `data.order`, `data.profit` |
+| `balance:event` | Balance & margin update | `data.equity`, `data.margin_level` |
+| `user:event` | User profile change | `data.leverage`, `data.group` |
+| `symbol:event` | Symbol settings update | `data.spread`, `data.swap_long` |
+| `group:event` | Group config change | `data.default_leverage` |
+| `symbols:reindex` | Symbol index map | `[[symbol, sym_index, sort_index], ...]` |
+| `security:reindex` | Security group map | `[[sec_index, sort_index], ...]` |
 
-2. **New Format** (recommended for IonTrader):
-   ```javascript
-   const data = {}; // If some data needed
-   platform.HealthCheck(data)
-     .then(response => console.log('Response:', response));
-   ```
-
-### Handling Responses
-
-Use an `EventEmitter` to listen for responses based on the `extID`:
-
-```javascript
-const events = require('events');
-const emitter = new events.EventEmitter();
-const platform = new IONPlatform(url, name, {}, null, null, token, emitter);
-
-const data = {}; // If some data needed
-data.extID = shortid.generate();
-platform.HealthCheck(data);
-
-emitter.once(data.extID, (response) => {
-  console.log('Response:', response);
-});
-```
-
-## Example
-
-To run the example provided in the package:
-
-```bash
-npm run example
-```
-
-The `example/example.js` demonstrates:
-- Initializing `IONPlatform` with minimal parameters.
-- Sending a `HealthCheck` command in the new format using `platform.HealthCheck(data)`.
-- Handling the response with `async/await`.
-- Generating `extID` with `shortid`.
-
-Replace placeholders (`url`, `token`) with real values before running.
-
-## API
-
-### `new IONPlatform(url, name, options, broker, ctx, token, emitter)`
-
-- `url` (string): Host and port (e.g., `'example.host:8080'`). Required.
-- `name` (string): Platform identifier. Required.
-- `options` (object): Configuration options. Defaults to `{ ignoreEvents: false, prefix: 'ion', mode: 'live' }`.
-- `broker` (object): Moleculer broker. Defaults to `{}`.
-- `ctx` (object): Moleculer context. Defaults to `{}`.
-- `token` (string): Authentication token. Required.
-- `emitter` (EventEmitter): Event emitter for handling responses. Defaults to a new `EventEmitter`.
+---
 
 ### Methods
 
-- `platform.send(data)`: Sends a command in the old format (`{ command, data, from, extID }`).
-- `platform.<CommandName>(data)`: Sends a command in the new format (e.g., `platform.HealthCheck({ ... })`).
-- `platform.destroy()`: Closes the connection.
+| Method | Description |
+|-------|-------------|
+| `subscribe(channels)` | Fast subscribe to symbols |
+| `unsubscribe(channels)` | Fast unsubscribe |
+| `platform.CommandName(data)` | Dynamic command (e.g., `AddUser`) |
+| `platform.send(payload)` | Legacy format: `{ command, data }` |
+| `platform.destroy()` | Close connection |
 
-### Events
+---
 
-- Emits responses on the provided `emitter` using the `extID` as the event name.
+## Examples
+
+### Subscribe & Unsubscribe
+
+```js
+await platform.subscribe(['GBPUSD', 'USDJPY']);
+await platform.unsubscribe('BTCUSD');
+```
+
+### Get All Users
+
+```js
+const users = await platform.GetUsers({});
+console.log(users);
+```
+
+### Listen to Balance Changes
+
+```js
+platform.emitter.on('balance:event', e => {
+  console.log(`User ${e.data.login}: Equity = ${e.data.equity}`);
+});
+```
+
+### Full Example
+
+See [`example/example.js`](./example/example.js)
+
+---
+
+## Configuration
+
+| Option | Type | Default | Description |
+|-------|------|---------|-------------|
+| `autoSubscribe` | `string[]` | `[]` | Auto-subscribe on connect |
+| `ignoreEvents` | `boolean` | `false` | Disable all event emission |
+| `mode` | `'live' \| 'demo'` | `'live'` | Environment mode |
+
+---
+
+## Documentation
+
+- **TCP API**: [https://iontrader.com/tcp](https://iontrader.com/tcp)
+- **Client API**: [https://iontrader.com/client-api](https://iontrader.com/client-api)
+- **FIX API**: [https://iontrader.com/fix-api](https://iontrader.com/fix-api)
+
+---
+
+## Requirements
+
+- Node.js **v14 or higher**
+- Valid **IonTrader JWT token**
+
+---
 
 ## License
 
-[MIT License](LICENSE)
+Distributed under the **MIT License**.  
+See [`LICENSE`](LICENSE) for more information.
 
-## Contributing
+---
 
-Contributions are welcome! Please submit issues or pull requests to the [GitHub repository](https://github.com/iontrader/server-api-js).
+<div align="center">
+
+**Made with passion for high-frequency trading**
+
+[iontrader.com](https://iontrader.com) · [GitHub](https://github.com/iontrader/server-api-js)
+
+</div>

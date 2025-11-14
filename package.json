@@ -1,7 +1,7 @@
 {
   "name": "ion-server-api",
-  "version": "0.1.4",
-  "description": "API connector for ION trading platform",
+  "version": "0.1.5",
+  "description": "High-performance TCP client for IonTrader — ultra-low latency server-to-server integration with real-time quotes, trade events, balance updates, and full symbol/user management.",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
@@ -11,8 +11,36 @@
     "type": "git",
     "url": "git+https://github.com/iontrader/server-api-js.git"
   },
-  "keywords": ["ion","iontrader","tcp","trading","api"],
-  "author": "MarSer",
+  "keywords": [
+    "iontrader",
+    "ion",
+    "trading",
+    "tcp",
+    "api",
+    "broker",
+    "forex",
+    "crypto",
+    "real-time",
+    "quotes",
+    "market-data",
+    "trade-events",
+    "balance",
+    "margin",
+    "server-to-server",
+    "low-latency",
+    "fintech",
+    "brokerage",
+    "nodejs"
+  ],
+  "categories": [
+    "Finance",
+    "Trading",
+    "API"
+  ],
+  "author": {
+    "name": "MarSer",
+    "url": "https://iontrader.com"
+  },
   "bugs": {
     "url": "https://github.com/iontrader/server-api-js/issues"
   },

@@ -33,7 +33,3 @@ logs/
 # Temporary files
 .tmp/
 .temp/
-
-# Optional: lockfile backups
-package-lock.json
-yarn.lock.*

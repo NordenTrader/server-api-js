@@ -286,21 +286,6 @@ platform.emitter.on('error', (err) => {
 });
 ```
 
-### Timeout Issues
-
-```js
-// Increase timeout (modify RESPONSE_TIMEOUT_MS in source)
-// Default is 30 seconds
-
-try {
-  const resp = await platform.GetLargeDataset({});
-} catch (err) {
-  if (err.message.includes('Timeout')) {
-    console.log('Request timed out - data too large or connection slow');
-  }
-}
-```
-
 ### Memory Leaks
 
 ```js
